@@ -30,7 +30,7 @@ if ( ! defined( 'WPINC' ) ) {
 }
 
 define( 'FOOAUTH_FILE', __FILE__);
-define( 'FOOAUTH_VERSION', '0.0.1' );
+define( 'FOOAUTH_VERSION', '0.0.3' );
 
 require_once( 'includes/class-fooauth.php' );
 add_action( 'plugins_loaded', array( 'FooAuth', 'get_instance' ) );

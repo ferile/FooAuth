@@ -4,10 +4,20 @@ if (!class_exists('FooAuth_Single_Signon')) {
   class FooAuth_Single_Signon {
 
     function __construct() {
+
+			// For debugging
+      // add_action('after_setup_theme', array($this, 'print_user_data'));
+
       add_action('after_setup_theme', array($this, 'auto_login'));
       add_action('wp_login', array($this, 'user_authorization_check'), 10, 2);
       add_action('load-post.php', array($this, 'auth_metabox_setup'));
       add_action('load-post-new.php', array($this, 'auth_metabox_setup'));
+
+			// Add columns on user admin page, and populate with AD data
+			add_filter( 'manage_users_columns', array($this, 'add_user_columns'));
+			add_filter( 'manage_users_custom_column', array($this, 'add_user_column_data'), 10, 3 );
+
+
       if (!is_admin()) {
         add_action('pre_get_posts', array($this, 'filter_allowed_posts'));
       }
@@ -16,23 +26,40 @@ if (!class_exists('FooAuth_Single_Signon')) {
       }
     }
 
+		function print_user_data() {
+			if(!is_admin()) {
+				$user_info = $this->get_current_user_info();
+				$username = $this->get_actual_username($user_info);
+				$user_id = username_exists($username);
+
+				$user = get_userdata($user_id);
+				
+				echo '<pre>';
+				print_r( get_user_meta( $user_id ) );
+				echo '</pre>';
+			}
+		}
+
+
     function auto_login() {
       if ($this->is_sso_enabled()) {
+        $user_info = $this->get_current_user_info();
+
+        if ($user_info === false) return;
+
+        $username = $this->get_actual_username($user_info);
+
+        //check if the user has access to log in to the site
+        $this->user_authorization_check($username, null);
+
+        if (!$this->can_user_be_created()) return;
+
+        $user_id = username_exists($username);
+
+        // If User is not on the login page, and is NOT logged in
         if (!$this->is_on_login_page() && !is_user_logged_in()) {
-          $user_info = $this->get_current_user_info();
 
-          if ($user_info === false) return;
-
-          $username = $this->get_actual_username($user_info);
-
-          //check if the user has access to log in to the site
-          $this->user_authorization_check($username, null);
-
-          if (!$this->can_user_be_created()) return;
-
-          $user_id = username_exists($username);
-
-          if (isset($user_id)) {
+          if ($user_id) {
             $this->update_user_details($username, $user_id);
           } else {
             $user_id = $this->register_new_user($username);
@@ -44,10 +71,15 @@ if (!class_exists('FooAuth_Single_Signon')) {
             do_action('wp_login', $username);
           }
         }
+        // If User is not on the login page, and is logged in, and not in the dashboard
+				else if (!$this->is_on_login_page() && is_user_logged_in() && !is_admin() ) {
+					// echo 'update user details!!';
+					$this->update_user_details($username, $user_id);
+				}
       }
     }
 
-    function user_authorization_check($user_login, $user) {
+    function user_authorization_check($user_login) {
       //if the user is not on the redirect page, check if they are authorized to login to the site
       if (!$this->is_on_redirect_page() && !$this->is_user_authorized($user_login)) {
         //User is not authorized to login to the site. Redirect to a selected page
@@ -91,17 +123,25 @@ if (!class_exists('FooAuth_Single_Signon')) {
 
           $user_groups = implode(',', $user_groups_array);
 
-          $email = (empty($entries[0]["mail"][0]) ? $username . '@' . $fqdn : $entries[0]["mail"][0]);
-          $firstname = $entries[0]["givenname"][0];
-          $surname = $entries[0]["sn"][0];
+					$email = (empty($entries[0]["mail"][0]) ? $username . '@' . $fqdn : $entries[0]["mail"][0]);
+					$firstname = $entries[0]["givenname"][0];
+					$surname = $entries[0]["sn"][0];
           $display_name = $entries[0]["$display_name_option"][0];
+					$department = $entries[0]["department"][0];
+					$location = $entries[0]["company"][0];
+
+          $manager_name = explode(',', $entries[0]["manager"][0]);
+					$manager = str_replace('CN=', '', $manager_name);
 
           return array(
             'email' => $email,
             'name' => $firstname,
             'surname' => $surname,
             'display_name' => $display_name,
-            'user_groups' => $user_groups
+            'user_groups' => $user_groups,
+            'department' => $department,
+						'location' => $location,
+						'manager' => $manager[0]
           );
 
         } catch (Exception $e) {
@@ -116,7 +156,14 @@ if (!class_exists('FooAuth_Single_Signon')) {
       if (empty($_SERVER['REMOTE_USER'])) return false;
 
       $current_credentials = explode('\\', $_SERVER['REMOTE_USER']);
-      list($ad_domain, , $ad_username) = $current_credentials;
+      // Server is not escaping slashes
+			if(count($current_credentials) === 2) {
+				list($ad_domain, $ad_username) = $current_credentials;
+			}
+			// Server is escaping slashes, this happens on derhrweb01.mgsops.net      
+			if(count($current_credentials) === 3) {
+				list($ad_domain, ,$ad_username) = $current_credentials;
+			}
 
       return array(
         'domain' => $ad_domain,
@@ -236,6 +283,9 @@ if (!class_exists('FooAuth_Single_Signon')) {
 
         wp_update_user($userdata);
         update_user_meta($user_id, 'user_groups', $user['user_groups']);
+        update_user_meta($user_id, 'department', $user['department']);
+				update_user_meta($user_id, 'location', $user['location']);
+				update_user_meta($user_id, 'manager', $user['manager']);
       }
     }
 
@@ -261,6 +311,9 @@ if (!class_exists('FooAuth_Single_Signon')) {
         $user_id = wp_insert_user($userdata);
 
         add_user_meta($user_id, 'user_groups', $user['user_groups'], true);
+        add_user_meta($user_id, 'department', $user['department'], true);
+				add_user_meta($user_id, 'location', $user['location'], true);
+				add_user_meta($user_id, 'manager', $user['manager'], true);
 
         return $user_id;
       }
@@ -269,10 +322,13 @@ if (!class_exists('FooAuth_Single_Signon')) {
 
     private function explode_dn($dn, $with_attributes = 0) {
       $result = ldap_explode_dn($dn, $with_attributes);
-      //translate hex code into ASCII again
-      foreach ($result as $key => $value) {
-        $result[$key] = preg_replace("/\\\([0-9A-Fa-f]{2})/e", "''.chr(hexdec('\\1')).''", $value);
-      }
+      
+      if(is_array($result)) :		
+        //translate hex code into ASCII again
+        foreach ($result as $key => $value) {
+          $result[$key] = preg_replace("/\\\([0-9A-Fa-f]{2})/e", "''.chr(hexdec('\\1')).''", $value);
+        }
+      endif;
       return $result;
     }
 
@@ -390,7 +446,7 @@ if (!class_exists('FooAuth_Single_Signon')) {
             }
           }
         }
-        $this - $excluded_posts = $excluded_posts;
+        $this-> $excluded_posts = $excluded_posts;
       }
       return $this->excluded_posts;
     }
@@ -406,5 +462,36 @@ if (!class_exists('FooAuth_Single_Signon')) {
         $query->set('post__not_in', $excluded_posts);
       }
     }
+
+
+		// Add new columns to the user's listing admin page
+		function add_user_columns($column) {
+			$column['location'] 	= 'Location';
+			$column['department'] 	= 'Department';
+			$column['manager'] 		= 'Manager';
+
+			return $column;
+		}
+		
+
+		// Add details to the columns
+		function add_user_column_data( $val, $column_name, $user_id ) {
+			$user = get_userdata($user_id);
+
+			switch ($column_name) {
+				case 'manager' :
+					return $user->manager;
+				break;
+				case 'location' :
+					return $user->location;
+				break;
+				case 'department' :
+					return $user->department;
+				break;
+			}
+			return;
+		}
+
+
   }
 }

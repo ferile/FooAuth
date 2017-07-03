@@ -77,13 +77,9 @@ function fooauth_create_settings() {
     'type' => 'select',
     'choices' => array(
       'samaccountname' => __('Username', 'fooauth'),
-      'displayName' => __('Display Name', 'fooauth'),
-      'description' => __('Description', 'fooauth'),
       'givenname' => __('First Name', 'fooauth'),
       'sn' => __('Surname', 'fooauth'),
-      'givenname sn' => __('First Name - Surname', 'fooauth'),
-      'cn' => __('Fullname', 'fooauth'),
-      'mail' => __('Email Address', 'fooauth')
+      'cn' => __('First name - Surname', 'fooauth')
     ),
     'default' => 'displayName',
     'desc' => __('The name that is shown when the user is logged in', 'fooauth'),
@@ -95,11 +91,12 @@ function fooauth_create_settings() {
     'title' => __('Default Role', 'fooauth'),
     'type' => 'select',
     'choices' => array(
-      'admin' => __('Admin', 'fooauth'),
       'pending' => __('Pending', 'fooauth'),
       'subscriber' => __('Subscriber', 'fooauth'),
+      'contributor' => __('Contributor', 'fooauth'),
+      'author' => __('Author', 'fooauth'),
       'editor' => __('Editor', 'fooauth'),
-      'contributor' => __('Contributor', 'fooauth')
+      'administrator' => __('Administrator', 'fooauth'), 
     ),
     'default' => 'pending',
     'desc' => __('Default role new accounts should be assigned to', 'fooauth'),
