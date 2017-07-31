@@ -8,15 +8,22 @@ if (!class_exists('FooAuth_Single_Signon')) {
 			// For debugging
       // add_action('after_setup_theme', array($this, 'print_user_data'));
 
-      add_action('after_setup_theme', array($this, 'auto_login'));
-      add_action('wp_login', array($this, 'user_authorization_check'), 10, 2);
-      add_action('load-post.php', array($this, 'auth_metabox_setup'));
-      add_action('load-post-new.php', array($this, 'auth_metabox_setup'));
+      add_action( 'after_setup_theme', array($this, 'auto_login'));
+      // add_action('wp_login', array($this, 'user_authorization_check'), 10, 2);
+      add_action( 'load-post.php', array($this, 'auth_metabox_setup'));
+      add_action( 'load-post-new.php', array($this, 'auth_metabox_setup'));
 
 			// Add columns on user admin page, and populate with AD data
 			add_filter( 'manage_users_columns', array($this, 'add_user_columns'));
 			add_filter( 'manage_users_custom_column', array($this, 'add_user_column_data'), 10, 3 );
 
+      add_filter( 'manage_pages_columns', array($this, 'add_page_columns'), 10, 2 );
+      add_filter( 'manage_pages_custom_column', array($this, 'add_page_columns_data'), 10, 2 );
+      add_action( 'bulk_edit_custom_box', array($this, 'add_to_bulk_quick_edit_custom_box'), 10, 2 );
+      add_action( 'quick_edit_custom_box', array($this, 'add_to_bulk_quick_edit_custom_box'), 10, 2 );
+      add_action( 'admin_print_scripts-edit.php', array($this, 'enqueue_edit_scripts') );
+      add_action( 'save_post', array($this, 'save_post'), 10, 2 );
+      add_action( 'wp_ajax_save_bulk_edit', array($this, 'save_bulk_edit') );      
 
       if (!is_admin()) {
         add_action('pre_get_posts', array($this, 'filter_allowed_posts'));
@@ -35,33 +42,38 @@ if (!class_exists('FooAuth_Single_Signon')) {
 				$user = get_userdata($user_id);
 				
 				echo '<pre>';
-				print_r( get_user_meta( $user_id ) );
+				print_r( $this->get_details_from_ldap( $username ) );
 				echo '</pre>';
 			}
 		}
 
-
+    // Auto Login a user
+    // =================================================================
     function auto_login() {
-      if ($this->is_sso_enabled()) {
+      if ($this->is_sso_enabled()  && !is_admin()) {
         $user_info = $this->get_current_user_info();
+        
+        // We cant get Windows Auth details, stop all processing
+        if ($user_info === false) return false;
 
-        if ($user_info === false) return;
-
-        $username = $this->get_actual_username($user_info);
+        $username = $this->get_actual_username($user_info);        
 
         //check if the user has access to log in to the site
-        $this->user_authorization_check($username, null);
+        // $this->user_authorization_check($username, null);
 
-        if (!$this->can_user_be_created()) return;
+        if (!$this->can_user_be_created()) return true;
 
+        // Check if Username exists already in Wordpress
         $user_id = username_exists($username);
 
         // If User is not on the login page, and is NOT logged in
-        if (!$this->is_on_login_page() && !is_user_logged_in()) {
+        if (!$this->is_on_login_page() && !is_user_logged_in()) { 
 
-          if ($user_id) {
-            $this->update_user_details($username, $user_id);
+          if ($user_id && !$this->is_admin_user($user_id) ) {
+            // User exists, update their details
+            $this->update_user_details($username, $user_id); 
           } else {
+            // User doesnt exist, create a new user for them
             $user_id = $this->register_new_user($username);
           }
 
@@ -72,18 +84,11 @@ if (!class_exists('FooAuth_Single_Signon')) {
           }
         }
         // If User is not on the login page, and is logged in, and not in the dashboard
-				else if (!$this->is_on_login_page() && is_user_logged_in() && !is_admin() ) {
-					// echo 'update user details!!';
-					$this->update_user_details($username, $user_id);
-				}
-      }
-    }
+        else if (!$this->is_on_login_page() && is_user_logged_in() && !$this->is_admin_user($user_id) ) {
+          // echo 'update user details!!';
+          $this->update_user_details($username, $user_id);
+        }
 
-    function user_authorization_check($user_login) {
-      //if the user is not on the redirect page, check if they are authorized to login to the site
-      if (!$this->is_on_redirect_page() && !$this->is_user_authorized($user_login)) {
-        //User is not authorized to login to the site. Redirect to a selected page
-        $this->redirect_unauthorized_users();
       }
     }
 
@@ -98,51 +103,41 @@ if (!class_exists('FooAuth_Single_Signon')) {
 
       $ldapCred = $ldap_username . '@' . $fqdn;
       try {
-        $connection = ldap_connect('ldap://' . $fqdn);
+        $connection = ldap_connect('ldap://' . $fqdn, 389);
         //Set some variables
         ldap_set_option($connection, LDAP_OPT_PROTOCOL_VERSION, 3);
         ldap_set_option($connection, LDAP_OPT_REFERRALS, 0);
+        ldap_set_option($connection, LDAP_OPT_NETWORK_TIMEOUT, 10);
 
         try {
           //Bind to the ldap directory
-          ldap_bind($connection, $ldapCred, $ldap_password);
+          $ldapbind = ldap_bind($connection, $ldapCred, $ldap_password);
 
-          //Search the directory
-          $result = ldap_search($connection, $ou, '(samaccountname=' . $username . ')');
-          //Create result set
-          $entries = ldap_get_entries($connection, $result);
+          if($ldapbind) {
+            //Search the directory
+            $result = ldap_search($connection, $ou, '(samaccountname=' . $username . ')');
+            //Create result set
+            $entries = ldap_get_entries($connection, $result);
 
-          $user_groups_dn = $entries[0]["memberof"];
-          $user_groups_array = array();
+            $email = (empty($entries[0]["mail"][0]) ? $username . '@' . $fqdn : $entries[0]["mail"][0]);
+            $firstname = $entries[0]["givenname"][0];
+            $surname = $entries[0]["sn"][0];
+            $display_name = $entries[0]["$display_name_option"][0];
+            $department = $entries[0]["department"][0];
+            $location = $entries[0]["company"][0];
+            $manager_name = explode(',', $entries[0]["manager"][0]);
+            $manager = str_replace('CN=', '', $manager_name);
 
-          //get just the group name out of the DN details
-          foreach ($user_groups_dn as $user_group) {
-            $group_details = $this->explode_dn($user_group);
-            $user_groups_array[] = str_replace('CN=', '', $group_details[0]);
-          }
-
-          $user_groups = implode(',', $user_groups_array);
-
-					$email = (empty($entries[0]["mail"][0]) ? $username . '@' . $fqdn : $entries[0]["mail"][0]);
-					$firstname = $entries[0]["givenname"][0];
-					$surname = $entries[0]["sn"][0];
-          $display_name = $entries[0]["$display_name_option"][0];
-					$department = $entries[0]["department"][0];
-					$location = $entries[0]["company"][0];
-
-          $manager_name = explode(',', $entries[0]["manager"][0]);
-					$manager = str_replace('CN=', '', $manager_name);
-
-          return array(
-            'email' => $email,
-            'name' => $firstname,
-            'surname' => $surname,
-            'display_name' => $display_name,
-            'user_groups' => $user_groups,
-            'department' => $department,
-						'location' => $location,
-						'manager' => $manager[0]
-          );
+            return array(
+              'email' => $email,
+              'name' => $firstname,
+              'surname' => $surname,
+              'display_name' => $display_name,
+              'department' => $department,
+              'location' => $location,
+              'manager' => $manager[0]
+            );
+          } 
 
         } catch (Exception $e) {
           return new WP_Error('666', 'Caught exception binding to LDAP Directory: ', $e->getMessage());
@@ -152,24 +147,7 @@ if (!class_exists('FooAuth_Single_Signon')) {
       }
     }
 
-    private function get_current_user_info() {
-      if (empty($_SERVER['REMOTE_USER'])) return false;
 
-      $current_credentials = explode('\\', $_SERVER['REMOTE_USER']);
-      // Server is not escaping slashes
-			if(count($current_credentials) === 2) {
-				list($ad_domain, $ad_username) = $current_credentials;
-			}
-			// Server is escaping slashes, this happens on derhrweb01.mgsops.net      
-			if(count($current_credentials) === 3) {
-				list($ad_domain, ,$ad_username) = $current_credentials;
-			}
-
-      return array(
-        'domain' => $ad_domain,
-        'username' => $ad_username
-      );
-    }
 
     private function get_current_page_url() {
       $page_URL = 'http';
@@ -230,44 +208,43 @@ if (!class_exists('FooAuth_Single_Signon')) {
       return false;
     }
 
-    private function is_user_authorized($username, $authorized_groups = '') {
-      if (empty($authorized_groups)) {
-        $authorized_groups = FooAuth::get_instance()->options()->get('authorized_groups', '');
-      }
+    // Get desktop login username and domain
+    // =================================================================
+    private function get_current_user_info() {
+      if (empty($_SERVER['REMOTE_USER'])) return false;
 
-      $user_id = username_exists($username);
+      $current_credentials = explode('\\', $_SERVER['REMOTE_USER']);
+      // Server is not escaping slashes
+			if(count($current_credentials) === 2) {
+				list($ad_domain, $ad_username) = $current_credentials;
+			}
+			// Server is escaping slashes, this happens on derhrweb01.mgsops.net      
+			if(count($current_credentials) === 3) {
+				list($ad_domain, ,$ad_username) = $current_credentials;
+			}
 
-      if ($this->is_admin_user($user_id)) {
-        return true;
-      }
-
-
-      if (isset($user_id)) {
-        $user_groups = get_user_meta($user_id, 'user_groups');
-      } else {
-        $user = $this->get_details_from_ldap($username);
-        $user_groups = $user['user_groups'];
-      }
-
-      if (!empty($authorized_groups)) {
-        if (!empty($user_groups)) {
-          $user_group_array = explode(',', $user_groups[0]);
-
-          $authorized_groups_array = explode(',', $authorized_groups);
-
-          foreach ($user_group_array as $user_group) {
-            foreach ($authorized_groups_array as $authorized_group) {
-              if (strtolower($user_group) === strtolower($authorized_group)) {
-                return true;
-              }
-            }
-          }
-        }
-        return false;
-      }
-      return true;
+      return array(
+        'domain' => $ad_domain,
+        'username' => $ad_username
+      );
     }
 
+    private function get_actual_username($remote_user) {
+      $username = $remote_user['username'];
+
+      if (is_user_logged_in()) {
+
+        $logged_in_user = wp_get_current_user();
+
+        if ($username !== $logged_in_user->user_login) {
+          $username = $logged_in_user->user_login;
+        }
+      }
+      return $username;
+    }
+
+    // Update user details in Wordpress
+    // =================================================================
     private function update_user_details($username, $user_id) {
       $auto_update_user = FooAuth::get_instance()->options()->get('auto_user_updates', false);
 
@@ -282,13 +259,13 @@ if (!class_exists('FooAuth_Single_Signon')) {
         );
 
         wp_update_user($userdata);
-        update_user_meta($user_id, 'user_groups', $user['user_groups']);
         update_user_meta($user_id, 'department', $user['department']);
 				update_user_meta($user_id, 'location', $user['location']);
 				update_user_meta($user_id, 'manager', $user['manager']);
       }
     }
-
+    // register a new user in Wordpress
+    // =================================================================
     private function register_new_user($username) {
       $user = $this->get_details_from_ldap($username);
 
@@ -310,7 +287,6 @@ if (!class_exists('FooAuth_Single_Signon')) {
 
         $user_id = wp_insert_user($userdata);
 
-        add_user_meta($user_id, 'user_groups', $user['user_groups'], true);
         add_user_meta($user_id, 'department', $user['department'], true);
 				add_user_meta($user_id, 'location', $user['location'], true);
 				add_user_meta($user_id, 'manager', $user['manager'], true);
@@ -320,18 +296,10 @@ if (!class_exists('FooAuth_Single_Signon')) {
       return $user;
     }
 
-    private function explode_dn($dn, $with_attributes = 0) {
-      $result = ldap_explode_dn($dn, $with_attributes);
-      
-      if(is_array($result)) :		
-        //translate hex code into ASCII again
-        foreach ($result as $key => $value) {
-          $result[$key] = preg_replace("/\\\([0-9A-Fa-f]{2})/e", "''.chr(hexdec('\\1')).''", $value);
-        }
-      endif;
-      return $result;
-    }
 
+
+    // Add Auth boxes to the post/page edit screens
+    // =================================================================
     function auth_metabox_setup() {
       add_action('add_meta_boxes', array($this, 'add_auth_metaboxes'));
       add_action('save_post', array($this, 'save_post_authorized_groups'), 10, 2);
@@ -343,6 +311,8 @@ if (!class_exists('FooAuth_Single_Signon')) {
     }
 
     function save_post_authorized_groups($post_id, $post) {
+      if (empty($_POST['fooauth_authorized_groups_nonce'])) return false; 
+
       $foo_auth_nonce = $_POST['fooauth_authorized_groups_nonce'];
 
       if (!isset($foo_auth_nonce) || !wp_verify_nonce($foo_auth_nonce, basename(__FILE__))) return $post_id;
@@ -352,8 +322,10 @@ if (!class_exists('FooAuth_Single_Signon')) {
       if (!current_user_can($post_type->cap->edit_post, $post_id)) return $post_id;
 
       $meta_key = 'fooauth-authorized-groups';
-      $new_meta_value = $_POST[$meta_key];
-      $meta_value = get_post_meta($post_id, $meta_key, true);
+      if($_POST[$meta_key]) {
+        $new_meta_value = implode(',', $_POST[$meta_key] );
+        $meta_value = get_post_meta($post_id, $meta_key, true);
+      }
 
       if (!empty($new_meta_value) && empty($meta_value)) {
         add_post_meta($post_id, $meta_key, $new_meta_value, true);
@@ -365,41 +337,210 @@ if (!class_exists('FooAuth_Single_Signon')) {
     }
 
     function authorized_group_metabox($object, $box) {
+      // Get all location groups from FooAuth Plugin, trim white space and sort alphabetically
+      $authorized_groups = explode(',', FooAuth::get_instance()->options()->get('authorized_groups', '') );
+      $authorized_groups = array_map('trim', $authorized_groups);
+      sort($authorized_groups);
+      
+      // Get this content's selected location groups
+      $selected_authorized_groups = explode(',', get_post_meta($object->ID, 'fooauth-authorized-groups', true) );
+      // Set nonce for the field
+      wp_nonce_field(basename(__FILE__), 'fooauth_authorized_groups_nonce');
       ?>
-      <?php wp_nonce_field(basename(__FILE__), 'fooauth_authorized_groups_nonce'); ?>
-      <p>
-        <label for="fooauth-authorized-groups"><?php _e('AD Groups', 'fooauth'); ?></label>
-        <br/>
-        <input class="widefat" type="text" name="fooauth-authorized-groups" id="fooauth-authorized-groups"
-               value="<?php echo get_post_meta($object->ID, 'fooauth-authorized-groups', true); ?>"
-               size="30"/>
-        <br/>
-        <small><?php _e('Comma separated list of AD groups', 'fooauth'); ?></small>
+      
+      <p class="post-attributes-label-wrapper">
+        <label class="post-attributes-label" for="fooauth-authorized-groups"><?php _e('Locations', 'fooauth'); ?></label>
       </p>
+      
+      <p><?php _e('Choose which location groups can view this content.', 'fooauth'); ?></p>
+
+      <select multiple size="<?php echo count($authorized_groups) + 1; ?>"  class="widefat" name="fooauth-authorized-groups[]" id="fooauth-authorized-groups">
+      <?php if($selected_authorized_groups[0] === '') {
+        echo '<option value="" selected>All locations</option>';
+      } else {
+        echo '<option value="">All locations</option>';
+      } ?>
+      
+
+      <?php foreach($authorized_groups as $value) {
+        $selected = '';
+        if(in_array($value, $selected_authorized_groups)) {
+          $selected = ' selected';
+        }
+        
+        printf(
+          '<option value="%s" %s>%s</option>',
+          $value,
+          $selected,
+          $value
+        );
+      };?>
+      </select>      
+
+      <p><?php _e('Hold down CTRL or SHIFT to select multiple locations.', 'fooauth'); ?></p>
+
     <?php
     }
 
-    private function redirect_unauthorized_users() {
-      $redirect_url = FooAuth::get_instance()->options()->get('unauthorized_redirect_page', '');
-      wp_redirect($redirect_url);
-      exit;
+    // Add new columns to the page listing edit screen, and populate with data
+    // =================================================================		
+    function add_page_columns( $columns ) {
+      $columns['authorised-group'] 	= 'Authorised Group';
+      return $columns;
     }
 
-    private function get_actual_username($remote_user) {
-      $username = $remote_user['username'];
-
-      if (is_user_logged_in()) {
-
-        $logged_in_user = wp_get_current_user();
-
-        if ($username !== $logged_in_user->user_login) {
-          $username = $logged_in_user->user_login;
-        }
+    function add_page_columns_data( $column_name, $post_id) {
+      switch( $column_name ) {
+          case 'authorised-group':
+            echo '<div id="fooauth-authorized-groups-' . $post_id . '">' . get_post_meta( $post_id, 'fooauth-authorized-groups', true ) . '</div>';
+          break;
       }
-      return $username;
     }
 
-    function check_user_authorization() {
+    function add_to_bulk_quick_edit_custom_box( $column_name, $post_type ) {
+      switch ( $post_type ) {
+          case 'page':
+
+            switch( $column_name ) {
+                case 'authorised-group':
+                  // Get all location groups from FooAuth Plugin, trim white space and sort alphabetically
+                  $authorized_groups = explode(',', FooAuth::get_instance()->options()->get('authorized_groups', '') );
+                  $authorized_groups = array_map('trim', $authorized_groups);
+                  sort($authorized_groups);  
+                  
+                  ?><fieldset class="inline-edit-col-left">
+                    <style>
+                    #wpbody-content .bulk-edit-row-page  .inline-edit-col-right,
+                    #wpbody-content .bulk-edit-row-page  .inline-edit-col-left,
+                    #wpbody-content .quick-edit-row-page .inline-edit-col-left, 
+                    #wpbody-content .quick-edit-row-page .inline-edit-col-right {
+                      width: 32%;
+                    }
+                    </style>
+                      <div class="inline-edit-group wp-clearfix">
+                        <label class="alignleft">
+                            <span class="title">Locations</span>
+                            <select multiple size="<?php echo count($authorized_groups) + 1; ?>"  class="widefat" name="fooauth-authorized-groups[]">
+                              <option value="">All locations</option>
+
+                            <?php foreach($authorized_groups as $value) {                            
+                              printf(
+                                '<option value="%s">%s</option>',
+                                $value,
+                                $value
+                              );
+                            };?>
+                            </select>
+                        </label>
+                      </div>
+                  </fieldset><?php
+                  break;
+            }
+            break;
+
+      }
+    }
+
+    function save_post( $post_id, $post ) {
+      $meta_key = 'fooauth-authorized-groups';
+
+      // don't save for autosave
+      if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE )
+          return $post_id;
+
+      // dont save for revisions
+      if ( isset( $post->post_type ) && $post->post_type == 'revision' )
+          return $post_id;
+
+      switch( $post->post_type ) {   
+        case 'page':             
+        // Because this action is run in several places, checking for the array key keeps WordPress from editing
+        // data that wasn't in the form, i.e. if you had this post meta on your "Quick Edit" but didn't have it
+        // on the "Edit Post" screen.       
+        if($_POST[$meta_key]) {
+          $new_meta_value = implode(',', $_POST[$meta_key] );
+          $meta_value = get_post_meta($post_id, $meta_key, true);
+        }
+
+        if (!empty($new_meta_value) && empty($meta_value)) {
+          add_post_meta($post_id, $meta_key, $new_meta_value, true);
+        } else if (!empty($new_meta_value) && $new_meta_value != $meta_value) {
+          update_post_meta($post_id, $meta_key, $new_meta_value);
+        } else if (empty($new_meta_value) && !empty($meta_value)) {
+          delete_post_meta($post_id, $meta_key, $meta_value);
+        }
+
+        break;      
+      }
+    }
+
+    
+    function save_bulk_edit() {
+      $ajax = 'authorised_groups';
+      $meta_key = 'fooauth-authorized-groups';
+      
+      // get our variables
+      $post_ids = ( isset( $_POST[ 'post_ids' ] ) && !empty( $_POST[ 'post_ids' ] ) ) ? $_POST[ 'post_ids' ] : array();
+      $authorised_groups = ( isset( $_POST[ $ajax ] ) && !empty( $_POST[ $ajax ] ) ) ? $_POST[ $ajax ] : ' ';
+      // if everything is in order
+      if ( !empty( $post_ids ) && is_array( $post_ids ) && !empty( $authorised_groups ) ) {
+          foreach( $post_ids as $post_id ) {
+            update_post_meta( $post_id, $meta_key, $authorised_groups );
+          }
+      }
+    }
+
+
+
+    function enqueue_edit_scripts() {   
+      wp_enqueue_script( 'rachel-carden-admin-edit', plugin_dir_url( __FILE__ ) .'quick_edit.js', array( 'jquery', 'inline-edit-post' ), '', true );
+    }
+
+    // Check user access
+    // =================================================================
+    public function is_user_authorized($username, $authorized_groups = '') {
+      if (empty($authorized_groups)) {
+        $authorized_groups = FooAuth::get_instance()->options()->get('authorized_groups', '');
+      }
+
+      $user_id = username_exists($username);
+
+      if ($this->is_admin_user($user_id)) {
+        return true;
+      }
+
+      if (isset($user_id)) {
+        $user_location = get_user_meta($user_id, 'location');
+      } 
+
+      if (!empty($authorized_groups)) {
+        if (!empty($user_location)) {
+          $user_group_array = array_map('trim', $user_location);
+
+          $authorized_groups_array = explode(',', $authorized_groups);
+          $authorized_groups_array = array_map('trim', $authorized_groups_array);
+
+          foreach ($user_group_array as $user_group) {
+            foreach ($authorized_groups_array as $authorized_group) {
+              if (strtolower($user_group) === strtolower($authorized_group)) {
+                return true;
+              }
+            }
+          }
+        }
+        return false;
+      }
+      return true;
+    }
+    public function user_authorization_check($user_login) {
+      //if the user is not on the redirect page, check if they are authorized to login to the site
+      if (!$this->is_on_redirect_page() && !$this->is_user_authorized($user_login)) {
+        //User is not authorized to login to the site. Redirect to a selected page
+        $this->redirect_unauthorized_users();
+      }
+    }
+
+    public function check_user_authorization() {
       $current_post = get_post();
       $meta_key = 'fooauth-authorized-groups';
 
@@ -419,10 +560,20 @@ if (!class_exists('FooAuth_Single_Signon')) {
       }
     }
 
+    public function redirect_unauthorized_users() {
+      $redirect_url = FooAuth::get_instance()->options()->get('unauthorized_redirect_page', '');
+      wp_redirect($redirect_url);
+      exit;
+    }
+
+
+
+    // Exclude posts from a user based on location
+    // =================================================================
     private $excluded_posts = false;
     private $filter_loop = true;
 
-    function get_excluded_posts() {
+    private function get_excluded_posts() {
       if ($this->excluded_posts === false) {
         $excluded_posts = array();
 
@@ -446,12 +597,12 @@ if (!class_exists('FooAuth_Single_Signon')) {
             }
           }
         }
-        $this-> $excluded_posts = $excluded_posts;
+        $this->excluded_posts = $excluded_posts;
       }
       return $this->excluded_posts;
     }
 
-    function filter_allowed_posts($query) {
+    public function filter_allowed_posts($query) {
 
       if ($this->filter_loop === false) return;
 
@@ -464,15 +615,20 @@ if (!class_exists('FooAuth_Single_Signon')) {
     }
 
 
-		// Add new columns to the user's listing admin page
+
+
+
+
+    // Add new columns to the user's listing admin page, and populate with data from AD
+    // =================================================================		
 		function add_user_columns($column) {
 			$column['location'] 	= 'Location';
-			$column['department'] 	= 'Department';
+			$column['department'] = 'Department';
 			$column['manager'] 		= 'Manager';
 
 			return $column;
-		}
-		
+		}		
+
 
 		// Add details to the columns
 		function add_user_column_data( $val, $column_name, $user_id ) {
@@ -491,6 +647,7 @@ if (!class_exists('FooAuth_Single_Signon')) {
 			}
 			return;
 		}
+
 
 
   }
